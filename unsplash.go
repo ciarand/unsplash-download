@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -21,7 +22,74 @@ type Image struct {
 	Post_Url   string
 }
 
-func Download(image Image) error {
+var (
+	numWorkers *int
+	numRetries *int
+	timeout    *int
+)
+
+func init() {
+	numWorkers = flag.Int("numWorkers", 3, "the number of workers to run at any point")
+	numRetries = flag.Int("numRetries", 3, "the number of times to retry a failed download")
+	flag.IntVar(numWorkers, "w", 3, "alias for numWorkers")
+	flag.IntVar(numWorkers, "r", 3, "alias for numRetries")
+
+	timeout = flag.Int("timeout", 60, "the number of seconds before timing out a worker")
+}
+
+func main() {
+	// increase the timeout
+	http.DefaultClient.Timeout = time.Second * 20
+
+	// a wait group for threads, in case they all timeout
+	threadWg := &sync.WaitGroup{}
+	// a wait group for images, in case we got 'em all
+	imgWg := &sync.WaitGroup{}
+
+	images, err := getImageList()
+	if err != nil {
+		fmt.Print(err)
+		os.Exit(1)
+	}
+
+	flag.Parse()
+
+	// add the number of images to the img wait group
+	imgWg.Add(len(images))
+	// number of threads to the thread wait group
+	threadWg.Add(*numWorkers)
+	// and a buffered channel of images w/ space = num of workers
+	in := make(chan Image, *numWorkers)
+
+	// begin the "producer" loop, filling the channel w/ images
+	go func() {
+		for _, v := range images {
+			in <- v
+		}
+	}()
+
+	// begin the consumer loops
+	for i := 0; i < *numWorkers; i += 1 {
+		go downloadLoop(in, imgWg, threadWg)
+	}
+
+	// wait for either the thread wait group or the image wait group
+
+	done := make(chan bool)
+
+	go func() {
+		threadWg.Wait()
+		done <- true
+	}()
+	go func() {
+		imgWg.Wait()
+		done <- true
+	}()
+
+	<-done
+}
+
+func (image *Image) Download() error {
 	// if we've already got it, don't re-get it
 	if _, err := os.Stat("images/" + image.Filename); err == nil {
 		return nil
@@ -47,89 +115,51 @@ func Download(image Image) error {
 	return nil
 }
 
-func main() {
-	// increase the timeout
-	http.DefaultClient.Timeout = time.Second * 20
+func getImageList() ([]Image, error) {
+	var images []Image
 
 	// GET all of our JSON
 	res, err := http.Get("https://unsplash.it/list")
 	if err != nil {
-		fmt.Print("Couldn't retrieve unsplash.it list:", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("Couldn't retrieve unsplash.it list: %s", err)
 	}
 	defer res.Body.Close()
 
 	body, err := ioutil.ReadAll(res.Body)
 	if err != nil {
-		fmt.Print("Couldn't read the unsplash.it list:", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("Couldn't read the unsplash.it list: %s", err)
 	}
 
-	var images []Image
-	if err = json.Unmarshal(body, &images); err != nil {
-		fmt.Printf("Couldn't unmarshal json (%s): %s", string(body), err)
-		os.Exit(1)
+	if err := json.Unmarshal(body, &images); err != nil {
+		return nil, fmt.Errorf("Couldn't unmarshal json (%s): %s", string(body), err)
 	}
 
 	if len(images) == 0 {
-		fmt.Printf("images collection is empty: %s", string(body))
-		os.Exit(1)
+		return nil, fmt.Errorf("images collection is empty: %s", string(body))
 	}
 
-	max := 3
-	imgWg := &sync.WaitGroup{}
-	imgWg.Add(len(images))
+	return images, nil
+}
 
-	threadWg := &sync.WaitGroup{}
-	threadWg.Add(max)
-
-	conns := make(chan Image, max)
-
-	// begin the "producer" loop
-	go func() {
-		for _, v := range images {
-			conns <- v
-		}
-	}()
-
-	// begin the consumer loop w/ a total of 10 gothreads
-	for i := 0; i < max; i += 1 {
-		go func(num int) {
-			// each of them will loop and block on receive
-			for {
-				select {
-				case img := <-conns:
-					// and try 3 times to download a file
-					for tries := 0; tries < 3; tries += 1 {
-						if err := Download(img); tries == 2 && err != nil {
-							fmt.Printf("Couldn't download %s: %s\n", img.Filename, err)
-						} else if err == nil {
-							// successful get
-							break
-						}
-					}
-
-					imgWg.Done()
-
-				case <-time.After(1 * time.Minute):
-					fmt.Printf("worker thread #%d done\n", num)
-					threadWg.Done()
-					return
+func downloadLoop(conns chan Image, imgWg, threadWg *sync.WaitGroup) {
+	for {
+		select {
+		case img := <-conns:
+			// and try 3 times to download a file
+			for tries := 0; tries < *numRetries; tries += 1 {
+				if err := img.Download(); tries == (*numRetries-1) && err != nil {
+					fmt.Printf("Couldn't download %s: %s\n", img.Filename, err)
+				} else if err == nil {
+					// successful get
+					break
 				}
 			}
-		}(i)
+
+			imgWg.Done()
+
+		case <-time.After(time.Duration(*timeout) * time.Second):
+			threadWg.Done()
+			return
+		}
 	}
-
-	done := make(chan bool)
-
-	go func() {
-		threadWg.Wait()
-		done <- true
-	}()
-	go func() {
-		imgWg.Wait()
-		done <- true
-	}()
-
-	<-done
 }
